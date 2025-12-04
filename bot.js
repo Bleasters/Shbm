@@ -1,3 +1,18 @@
+// Render için HTTP server
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(`
+    <h1>🤖 Sahibinden Bot Çalışıyor!</h1>
+    <p>Bot aktif ve Telegram bildirimleri gönderiyor.</p>
+    <p>Zaman: ${new Date().toLocaleString('tr-TR')}</p>
+  `);
+}).listen(PORT, () => {
+  console.log(`✅ HTTP server ${PORT} portunda çalışıyor`);
+}); 
+
 const { chromium } = require('playwright');
 const TelegramBot = require('node-telegram-bot-api');
 
