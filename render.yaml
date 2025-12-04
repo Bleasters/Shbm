@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: sahibinden-bot
+    env: node
+    buildCommand: npm install && npx playwright install chromium && npx playwright install-deps
+    startCommand: npm start
