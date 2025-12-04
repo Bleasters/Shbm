@@ -1,0 +1,12 @@
+{
+  "name": "sahibinden-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "node-telegram-bot-api": "^0.64.0"
+  }
+}
