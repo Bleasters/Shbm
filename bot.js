@@ -80,16 +80,12 @@ async function fetchListings(searchUrl) {
 
     const page = await context.newPage();
     
-    // Otomasyon tespitini gizle
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
       Object.defineProperty(navigator, 'languages', { get: () => ['tr-TR', 'tr', 'en-US', 'en'] });
-      
-      // Chrome runtime
       window.chrome = { runtime: {} };
       
-      // Permissions
       const originalQuery = window.navigator.permissions.query;
       window.navigator.permissions.query = (parameters) => (
         parameters.name === 'notifications' ?
@@ -100,7 +96,6 @@ async function fetchListings(searchUrl) {
     
     log(`URL açılıyor: ${searchUrl}`);
     
-    // Önce ana sayfaya git (cookie al)
     try {
       await page.goto('https://www.sahibinden.com', {
         waitUntil: 'domcontentloaded',
@@ -112,7 +107,6 @@ async function fetchListings(searchUrl) {
       log('Ana sayfa yüklenemedi, devam ediliyor...');
     }
     
-    // Şimdi arama sayfasına git
     await page.goto(searchUrl, { 
       waitUntil: 'domcontentloaded',
       timeout: 90000
@@ -123,25 +117,17 @@ async function fetchListings(searchUrl) {
     const title = await page.title();
     log(`Sayfa başlığı: ${title}`);
     
-    // Eğer hala giriş sayfasındaysa
     if (title.includes('Giriş') || title.includes('Login')) {
-      log('⚠️ Giriş sayfasına yönlendirildi! IP engellenmiş olabilir.');
-      
-      // Yine de içeriği kontrol et
-      const content = await page.content();
-      log(`Sayfa içeriği (ilk 500 char): ${content.substring(0, 500)}`);
+      log('⚠️ Giriş sayfasına yönlendirildi!');
     }
 
     const listings = await page.evaluate(() => {
       const items = [];
       
-      // Tüm link'leri tara
       const allLinks = document.querySelectorAll('a[href]');
       const ilanLinks = Array.from(allLinks).filter(a => 
-        a.href.includes('/ilan/') || a.href.includes('sahibinden.com/') && a.href.match(/\d{6,}/)
+        a.href.includes('/ilan/') || (a.href.includes('sahibinden.com/') && a.href.match(/\d{6,}/))
       );
-      
-      log(`Toplam ${ilanLinks.length} potansiyel ilan linki bulundu`);
       
       ilanLinks.forEach(link => {
         const url = link.href;
@@ -149,7 +135,6 @@ async function fetchListings(searchUrl) {
         
         if (!id) return;
         
-        // Link'in parent elementini bul
         let parent = link.closest('tr, li, div[class*="item"], div[class*="card"]');
         if (!parent) parent = link.parentElement;
         
@@ -161,15 +146,16 @@ async function fetchListings(searchUrl) {
         const location = parent?.querySelector('[class*="location"]')?.textContent?.trim() || '';
         const date = parent?.querySelector('[class*="date"]')?.textContent?.trim() || '';
 
-        if (title.length > 5) { // Geçerli başlık kontrolü
+        if (title.length > 5) {
           items.push({ id, title, price, location, date, url });
         }
       });
 
-      // Deduplicate by ID
       const unique = [...new Map(items.map(item => [item.id, item])).values()];
       return unique;
     });
+    
+    log(`${listings.length} potansiyel ilan linki tarandı`);
 
     await browser.close();
     
