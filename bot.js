@@ -45,25 +45,52 @@ async function sendTelegram(text) {
 async function fetchListings(searchUrl) {
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--disable-gpu',
+      '--disable-blink-features=AutomationControlled'
+    ]
   });
 
   try {
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       viewport: { width: 1920, height: 1080 },
-      locale: 'tr-TR'
+      locale: 'tr-TR',
+      timezoneId: 'Europe/Istanbul'
     });
 
     const page = await context.newPage();
+    
+    // Otomasyon algılamasını gizle
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined
+      });
+    });
+    
     log(`URL açılıyor: ${searchUrl}`);
     
+    // Timeout'u artır ve load'a geç
     await page.goto(searchUrl, { 
-      waitUntil: 'networkidle',
-      timeout: 60000 
+      waitUntil: 'load',  // networkidle yerine load
+      timeout: 120000  // 2 dakika
     });
 
-    await page.waitForTimeout(2000 + Math.random() * 3000);
+    // Sayfanın yüklenmesini bekle
+    await page.waitForTimeout(5000);
+
+    // İlan varsa bekle
+    try {
+      await page.waitForSelector('tr.searchResultsItem, .searchResultsItem', { 
+        timeout: 10000 
+      });
+    } catch (e) {
+      log('İlan elementi bulunamadı, sayfa yapısı değişmiş olabilir');
+    }
 
     const listings = await page.evaluate(() => {
       const items = [];
@@ -89,6 +116,7 @@ async function fetchListings(searchUrl) {
     });
 
     await browser.close();
+    
     log(`${listings.length} ilan bulundu`);
     return listings;
 
