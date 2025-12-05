@@ -78,36 +78,92 @@ async function fetchListings(searchUrl) {
     log(`URL açılıyor: ${searchUrl}`);
     
     await page.goto(searchUrl, { 
-      waitUntil: 'load',
-      timeout: 120000
+      waitUntil: 'domcontentloaded',
+      timeout: 90000
     });
 
-    await page.waitForTimeout(5000);
+    // Daha uzun bekle
+    await page.waitForTimeout(8000);
 
-    try {
-      await page.waitForSelector('tr.searchResultsItem, .searchResultsItem', { 
-        timeout: 10000 
-      });
-    } catch (e) {
-      log('İlan elementi bulunamadı');
-    }
+    // DEBUG: Sayfa başlığını kontrol et
+    const title = await page.title();
+    log(`Sayfa başlığı: ${title}`);
 
+    // DEBUG: İlan elementlerini ara
+    const hasItems = await page.evaluate(() => {
+      const tr = document.querySelectorAll('tr.searchResultsItem');
+      const ul = document.querySelectorAll('ul.searchResultsItem');
+      const table = document.querySelectorAll('table.searchResultsTable');
+      
+      console.log('TR elementi:', tr.length);
+      console.log('UL elementi:', ul.length);
+      console.log('TABLE elementi:', table.length);
+      
+      return {
+        tr: tr.length,
+        ul: ul.length,
+        table: table.length,
+        hasContent: document.body.innerHTML.length
+      };
+    });
+    
+    log(`Debug: TR=${hasItems.tr}, UL=${hasItems.ul}, TABLE=${hasItems.table}, Content=${hasItems.hasContent} bytes`);
+
+    // Farklı selector'ları dene
     const listings = await page.evaluate(() => {
       const items = [];
-      const rows = document.querySelectorAll('tr.searchResultsItem');
+      
+      // Yöntem 1: TR elementi
+      let rows = document.querySelectorAll('tr.searchResultsItem');
+      
+      // Yöntem 2: UL elementi (mobil)
+      if (rows.length === 0) {
+        rows = document.querySelectorAll('ul.searchResultsItem li');
+      }
+      
+      // Yöntem 3: Genel arama
+      if (rows.length === 0) {
+        rows = document.querySelectorAll('[class*="searchResult"]');
+      }
       
       rows.forEach(row => {
-        const link = row.querySelector('a[href*="/ilan/"]');
+        // İlan linki bul
+        const link = row.querySelector('a[href*="/ilan/"]') || 
+                     row.querySelector('a[href*="sahibinden.com"]');
+        
         if (!link) return;
         
-        const url = link.href;
-        const id = url.match(/\/(\d+)$/)?.[1];
+        let url = link.href;
+        
+        // Relative URL'i düzelt
+        if (!url.startsWith('http')) {
+          url = 'https://www.sahibinden.com' + url;
+        }
+        
+        const id = url.match(/\/(\d+)$/)?.[1] || url.match(/ilan\/\w+-(\d+)/)?.[1];
         if (!id) return;
 
-        const title = row.querySelector('.classifiedTitle')?.textContent?.trim();
-        const price = row.querySelector('.searchResultsPriceValue')?.textContent?.trim();
-        const location = row.querySelector('.searchResultsLocationValue')?.textContent?.trim();
-        const date = row.querySelector('.searchResultsDateValue span')?.getAttribute('title');
+        // Başlık
+        const title = link.textContent?.trim() || 
+                     row.querySelector('.classifiedTitle')?.textContent?.trim() ||
+                     row.querySelector('[class*="title"]')?.textContent?.trim() ||
+                     'Başlık yok';
+
+        // Fiyat
+        const price = row.querySelector('.searchResultsPriceValue')?.textContent?.trim() ||
+                     row.querySelector('[class*="price"]')?.textContent?.trim() ||
+                     '';
+
+        // Konum
+        const location = row.querySelector('.searchResultsLocationValue')?.textContent?.trim() ||
+                        row.querySelector('[class*="location"]')?.textContent?.trim() ||
+                        '';
+
+        // Tarih
+        const date = row.querySelector('.searchResultsDateValue span')?.getAttribute('title') ||
+                    row.querySelector('.searchResultsDateValue')?.textContent?.trim() ||
+                    row.querySelector('[class*="date"]')?.textContent?.trim() ||
+                    '';
 
         items.push({ id, title, price, location, date, url });
       });
@@ -115,14 +171,24 @@ async function fetchListings(searchUrl) {
       return items;
     });
 
+    // DEBUG: Screenshot al (opsiyonel)
+    // await page.screenshot({ path: 'debug.png', fullPage: true });
+
     await browser.close();
     
     log(`${listings.length} ilan bulundu`);
+    
+    // İlk 3 ilanı logla (debug)
+    if (listings.length > 0) {
+      log(`İlk ilan: ${JSON.stringify(listings[0])}`);
+    }
+    
     return listings;
 
   } catch (error) {
     await browser.close();
     log(`Hata: ${error.message}`);
+    log(`Stack: ${error.stack}`);
     return [];
   }
 }
