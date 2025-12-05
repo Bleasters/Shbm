@@ -53,9 +53,9 @@ async function fetchListings(searchUrl) {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--disable-gpu',
-      '--disable-blink-features=AutomationControlled'
+      '--disable-blink-features=AutomationControlled',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process'
     ]
   });
 
@@ -64,121 +64,117 @@ async function fetchListings(searchUrl) {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       viewport: { width: 1920, height: 1080 },
       locale: 'tr-TR',
-      timezoneId: 'Europe/Istanbul'
+      timezoneId: 'Europe/Istanbul',
+      extraHTTPHeaders: {
+        'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Cache-Control': 'max-age=0'
+      }
     });
 
     const page = await context.newPage();
     
+    // Otomasyon tespitini gizle
     await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', {
-        get: () => undefined
-      });
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['tr-TR', 'tr', 'en-US', 'en'] });
+      
+      // Chrome runtime
+      window.chrome = { runtime: {} };
+      
+      // Permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
     });
     
     log(`URL açılıyor: ${searchUrl}`);
     
+    // Önce ana sayfaya git (cookie al)
+    try {
+      await page.goto('https://www.sahibinden.com', {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000
+      });
+      await page.waitForTimeout(3000);
+      log('Ana sayfa yüklendi, cookie alındı');
+    } catch (e) {
+      log('Ana sayfa yüklenemedi, devam ediliyor...');
+    }
+    
+    // Şimdi arama sayfasına git
     await page.goto(searchUrl, { 
       waitUntil: 'domcontentloaded',
       timeout: 90000
     });
 
-    // Daha uzun bekle
     await page.waitForTimeout(8000);
 
-    // DEBUG: Sayfa başlığını kontrol et
     const title = await page.title();
     log(`Sayfa başlığı: ${title}`);
-
-    // DEBUG: İlan elementlerini ara
-    const hasItems = await page.evaluate(() => {
-      const tr = document.querySelectorAll('tr.searchResultsItem');
-      const ul = document.querySelectorAll('ul.searchResultsItem');
-      const table = document.querySelectorAll('table.searchResultsTable');
-      
-      console.log('TR elementi:', tr.length);
-      console.log('UL elementi:', ul.length);
-      console.log('TABLE elementi:', table.length);
-      
-      return {
-        tr: tr.length,
-        ul: ul.length,
-        table: table.length,
-        hasContent: document.body.innerHTML.length
-      };
-    });
     
-    log(`Debug: TR=${hasItems.tr}, UL=${hasItems.ul}, TABLE=${hasItems.table}, Content=${hasItems.hasContent} bytes`);
+    // Eğer hala giriş sayfasındaysa
+    if (title.includes('Giriş') || title.includes('Login')) {
+      log('⚠️ Giriş sayfasına yönlendirildi! IP engellenmiş olabilir.');
+      
+      // Yine de içeriği kontrol et
+      const content = await page.content();
+      log(`Sayfa içeriği (ilk 500 char): ${content.substring(0, 500)}`);
+    }
 
-    // Farklı selector'ları dene
     const listings = await page.evaluate(() => {
       const items = [];
       
-      // Yöntem 1: TR elementi
-      let rows = document.querySelectorAll('tr.searchResultsItem');
+      // Tüm link'leri tara
+      const allLinks = document.querySelectorAll('a[href]');
+      const ilanLinks = Array.from(allLinks).filter(a => 
+        a.href.includes('/ilan/') || a.href.includes('sahibinden.com/') && a.href.match(/\d{6,}/)
+      );
       
-      // Yöntem 2: UL elementi (mobil)
-      if (rows.length === 0) {
-        rows = document.querySelectorAll('ul.searchResultsItem li');
-      }
+      log(`Toplam ${ilanLinks.length} potansiyel ilan linki bulundu`);
       
-      // Yöntem 3: Genel arama
-      if (rows.length === 0) {
-        rows = document.querySelectorAll('[class*="searchResult"]');
-      }
-      
-      rows.forEach(row => {
-        // İlan linki bul
-        const link = row.querySelector('a[href*="/ilan/"]') || 
-                     row.querySelector('a[href*="sahibinden.com"]');
+      ilanLinks.forEach(link => {
+        const url = link.href;
+        const id = url.match(/\/(\d{6,})$/)?.[1] || url.match(/ilan\/\w+-(\d{6,})/)?.[1];
         
-        if (!link) return;
-        
-        let url = link.href;
-        
-        // Relative URL'i düzelt
-        if (!url.startsWith('http')) {
-          url = 'https://www.sahibinden.com' + url;
-        }
-        
-        const id = url.match(/\/(\d+)$/)?.[1] || url.match(/ilan\/\w+-(\d+)/)?.[1];
         if (!id) return;
-
-        // Başlık
+        
+        // Link'in parent elementini bul
+        let parent = link.closest('tr, li, div[class*="item"], div[class*="card"]');
+        if (!parent) parent = link.parentElement;
+        
         const title = link.textContent?.trim() || 
-                     row.querySelector('.classifiedTitle')?.textContent?.trim() ||
-                     row.querySelector('[class*="title"]')?.textContent?.trim() ||
-                     'Başlık yok';
+                     parent?.querySelector('[class*="title"]')?.textContent?.trim() ||
+                     'Başlık bulunamadı';
 
-        // Fiyat
-        const price = row.querySelector('.searchResultsPriceValue')?.textContent?.trim() ||
-                     row.querySelector('[class*="price"]')?.textContent?.trim() ||
-                     '';
+        const price = parent?.querySelector('[class*="price"]')?.textContent?.trim() || '';
+        const location = parent?.querySelector('[class*="location"]')?.textContent?.trim() || '';
+        const date = parent?.querySelector('[class*="date"]')?.textContent?.trim() || '';
 
-        // Konum
-        const location = row.querySelector('.searchResultsLocationValue')?.textContent?.trim() ||
-                        row.querySelector('[class*="location"]')?.textContent?.trim() ||
-                        '';
-
-        // Tarih
-        const date = row.querySelector('.searchResultsDateValue span')?.getAttribute('title') ||
-                    row.querySelector('.searchResultsDateValue')?.textContent?.trim() ||
-                    row.querySelector('[class*="date"]')?.textContent?.trim() ||
-                    '';
-
-        items.push({ id, title, price, location, date, url });
+        if (title.length > 5) { // Geçerli başlık kontrolü
+          items.push({ id, title, price, location, date, url });
+        }
       });
 
-      return items;
+      // Deduplicate by ID
+      const unique = [...new Map(items.map(item => [item.id, item])).values()];
+      return unique;
     });
-
-    // DEBUG: Screenshot al (opsiyonel)
-    // await page.screenshot({ path: 'debug.png', fullPage: true });
 
     await browser.close();
     
     log(`${listings.length} ilan bulundu`);
     
-    // İlk 3 ilanı logla (debug)
     if (listings.length > 0) {
       log(`İlk ilan: ${JSON.stringify(listings[0])}`);
     }
@@ -188,7 +184,6 @@ async function fetchListings(searchUrl) {
   } catch (error) {
     await browser.close();
     log(`Hata: ${error.message}`);
-    log(`Stack: ${error.stack}`);
     return [];
   }
 }
