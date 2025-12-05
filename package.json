@@ -6,7 +6,7 @@
     "start": "node bot.js"
   },
   "dependencies": {
-    "playwright": "^1.40.0",
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.64.0",
+    "xml2js": "^0.6.2"
   }
 }
