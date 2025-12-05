@@ -1,6 +1,7 @@
-const { chromium } = require('playwright');
 const TelegramBot = require('node-telegram-bot-api');
 const http = require('http');
+const https = require('https');
+const { parseStringPromise } = require('xml2js');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || 'BURAYA_TOKEN';
 const CHAT_ID = process.env.CHAT_ID || 'BURAYA_CHAT_ID';
@@ -22,8 +23,15 @@ http.createServer((req, res) => {
   initializeBot();
 });
 
+// Varsayılan arama - otomobil ilanları
+const DEFAULT_SEARCH = {
+  id: Date.now(),
+  url: 'https://www.sahibinden.com/otomobil?sorting=date_desc&utm_source=paylas&utm_medium=arama_sonuc&utm_campaign=sahibinden_paylas&utm_content=174536269',
+  interval: 5
+};
+
 // Global değişkenler
-let searches = [];
+let searches = [DEFAULT_SEARCH];
 let seenListings = new Map();
 let intervals = new Map();
 let isRunning = false;
@@ -45,130 +53,104 @@ async function sendMessage(text, options = {}) {
   }
 }
 
-// Sahibinden'den ilanları çek
-async function fetchListings(searchUrl) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
-      '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process'
-    ]
-  });
+// URL'den RSS feed URL'si oluştur
+function getRssFeedUrl(searchUrl) {
+  // Zaten RSS ise olduğu gibi döndür
+  if (searchUrl.includes('rss=true') || searchUrl.includes('.xml')) {
+    return searchUrl;
+  }
+  
+  // URL'e RSS parametresi ekle
+  const separator = searchUrl.includes('?') ? '&' : '?';
+  return `${searchUrl}${separator}rss=true`;
+}
 
-  try {
-    const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      viewport: { width: 1920, height: 1080 },
-      locale: 'tr-TR',
-      timezoneId: 'Europe/Istanbul',
-      extraHTTPHeaders: {
-        'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Cache-Control': 'max-age=0'
+// RSS feed'i çek
+async function fetchRssFeed(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+        'Accept-Language': 'tr-TR,tr;q=0.9',
       }
-    });
-
-    const page = await context.newPage();
-    
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['tr-TR', 'tr', 'en-US', 'en'] });
-      window.chrome = { runtime: {} };
+    }, (res) => {
+      let data = '';
       
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-          Promise.resolve({ state: Notification.permission }) :
-          originalQuery(parameters)
-      );
-    });
-    
-    log(`URL açılıyor: ${searchUrl}`);
-    
-    try {
-      await page.goto('https://www.sahibinden.com', {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000
-      });
-      await page.waitForTimeout(3000);
-      log('Ana sayfa yüklendi, cookie alındı');
-    } catch (e) {
-      log('Ana sayfa yüklenemedi, devam ediliyor...');
-    }
-    
-    await page.goto(searchUrl, { 
-      waitUntil: 'domcontentloaded',
-      timeout: 90000
-    });
-
-    await page.waitForTimeout(8000);
-
-    const title = await page.title();
-    log(`Sayfa başlığı: ${title}`);
-    
-    if (title.includes('Giriş') || title.includes('Login')) {
-      log('⚠️ Giriş sayfasına yönlendirildi!');
-    }
-
-    const listings = await page.evaluate(() => {
-      const items = [];
+      res.on('data', chunk => data += chunk);
       
-      const allLinks = document.querySelectorAll('a[href]');
-      const ilanLinks = Array.from(allLinks).filter(a => 
-        a.href.includes('/ilan/') || (a.href.includes('sahibinden.com/') && a.href.match(/\d{6,}/))
-      );
-      
-      ilanLinks.forEach(link => {
-        const url = link.href;
-        const id = url.match(/\/(\d{6,})$/)?.[1] || url.match(/ilan\/\w+-(\d{6,})/)?.[1];
-        
-        if (!id) return;
-        
-        let parent = link.closest('tr, li, div[class*="item"], div[class*="card"]');
-        if (!parent) parent = link.parentElement;
-        
-        const title = link.textContent?.trim() || 
-                     parent?.querySelector('[class*="title"]')?.textContent?.trim() ||
-                     'Başlık bulunamadı';
-
-        const price = parent?.querySelector('[class*="price"]')?.textContent?.trim() || '';
-        const location = parent?.querySelector('[class*="location"]')?.textContent?.trim() || '';
-        const date = parent?.querySelector('[class*="date"]')?.textContent?.trim() || '';
-
-        if (title.length > 5) {
-          items.push({ id, title, price, location, date, url });
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          resolve(data);
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}`));
         }
       });
+    }).on('error', reject);
+  });
+}
 
-      const unique = [...new Map(items.map(item => [item.id, item])).values()];
-      return unique;
-    });
+// RSS XML'i parse et
+async function parseRss(xml) {
+  try {
+    const result = await parseStringPromise(xml);
+    const items = result.rss?.channel?.[0]?.item || [];
     
-    log(`${listings.length} potansiyel ilan linki tarandı`);
+    const listings = items.map(item => {
+      const link = item.link?.[0] || '';
+      const id = link.match(/\/(\d+)$/)?.[1] || link.match(/ilan\/\w+-(\d+)/)?.[1];
+      
+      const title = item.title?.[0] || '';
+      const description = item.description?.[0] || '';
+      const pubDate = item.pubDate?.[0] || '';
+      
+      // Description'dan fiyat ve konum çıkar
+      let price = '';
+      let location = '';
+      
+      if (description) {
+        const priceMatch = description.match(/Fiyat:\s*([^<]+)/i);
+        const locationMatch = description.match(/İl-İlçe:\s*([^<]+)/i);
+        
+        price = priceMatch ? priceMatch[1].trim() : '';
+        location = locationMatch ? locationMatch[1].trim() : '';
+      }
+      
+      return {
+        id,
+        title,
+        price,
+        location,
+        date: pubDate,
+        url: link
+      };
+    }).filter(item => item.id); // Sadece ID'si olanlar
+    
+    return listings;
+  } catch (error) {
+    log(`RSS parse hatası: ${error.message}`);
+    return [];
+  }
+}
 
-    await browser.close();
+// Sahibinden'den ilanları çek (RSS)
+async function fetchListings(searchUrl) {
+  try {
+    const rssUrl = getRssFeedUrl(searchUrl);
+    log(`RSS feed açılıyor: ${rssUrl}`);
+    
+    const xml = await fetchRssFeed(rssUrl);
+    const listings = await parseRss(xml);
     
     log(`${listings.length} ilan bulundu`);
     
     if (listings.length > 0) {
-      log(`İlk ilan: ${JSON.stringify(listings[0])}`);
+      log(`İlk ilan: ${listings[0].title.substring(0, 50)}...`);
     }
     
     return listings;
-
+    
   } catch (error) {
-    await browser.close();
     log(`Hata: ${error.message}`);
     return [];
   }
@@ -182,7 +164,7 @@ async function checkNewListings(search, manualCheck = false) {
     if (listings.length === 0) {
       log('İlan bulunamadı');
       if (manualCheck) {
-        await sendMessage('⚠️ İlan bulunamadı veya sayfa yüklenemedi.');
+        await sendMessage('⚠️ İlan bulunamadı. URL geçerli mi kontrol et.');
       }
       return;
     }
@@ -277,6 +259,7 @@ function startAllChecks() {
 bot.onText(/\/start/, async (msg) => {
   const welcomeMsg = 
     `🤖 <b>Sahibinden.com Bot'a Hoş Geldiniz!</b>\n\n` +
+    `🚗 Varsayılan arama aktif: Otomobil ilanları\n\n` +
     `📋 <b>Komutlar:</b>\n\n` +
     `/ekle - Yeni arama URL'si ekle\n` +
     `/liste - Tüm aramaları listele\n` +
@@ -285,7 +268,7 @@ bot.onText(/\/start/, async (msg) => {
     `/durdur - Botu durdur\n` +
     `/durum - Bot durumunu göster\n` +
     `/yardim - Yardım mesajı\n\n` +
-    `💡 <b>İpucu:</b> Önce /ekle ile URL ekle, sonra /basla ile başlat!`;
+    `💡 <b>Otomatik başlatıldı!</b> /durdur ile durdurabilirsin.`;
   
   await sendMessage(welcomeMsg);
 });
@@ -294,37 +277,38 @@ bot.onText(/\/start/, async (msg) => {
 bot.onText(/\/yardim/, async (msg) => {
   const helpMsg = 
     `📖 <b>Kullanım Kılavuzu</b>\n\n` +
-    `1️⃣ <b>URL Eklemek:</b>\n` +
-    `/ekle komutunu kullan\n` +
-    `Örnek: Sahibinden.com'da arama yap, URL'i kopyala\n\n` +
-    `2️⃣ <b>Kontrol Süresi:</b>\n` +
-    `Dakika cinsinden gir (örn: 5)\n\n` +
-    `3️⃣ <b>Botu Başlat:</b>\n` +
-    `/basla komutu ile otomatik kontrol başlar\n\n` +
-    `4️⃣ <b>Yeni İlan:</b>\n` +
-    `Bot bulduğunda otomatik bildirim gönderir\n\n` +
-    `💡 <b>İpuçları:</b>\n` +
-    `• Çok sık kontrol etme (min 3 dakika)\n` +
-    `• Birden fazla arama ekleyebilirsin\n` +
-    `• /yenile ile anlık kontrol yapabilirsin`;
+    `<b>🔍 URL Nasıl Bulunur?</b>\n` +
+    `1. Sahibinden.com'a git\n` +
+    `2. İstediğin aramayı yap (kategori, filtreler)\n` +
+    `3. Arama sonuç sayfasının URL'ini kopyala\n` +
+    `4. /ekle ile bota gönder\n\n` +
+    `<b>⚙️ Bot Nasıl Çalışır?</b>\n` +
+    `• Bot RSS feed kullanır (hızlı ve güvenilir)\n` +
+    `• Her X dakikada otomatik kontrol eder\n` +
+    `• Yeni ilan bulunca anında bildirir\n\n` +
+    `<b>💡 İpuçları:</b>\n` +
+    `• Minimum 3 dakika kontrol süresi öner\n` +
+    `• "Tarihe göre sırala" seçeneğini kullan\n` +
+    `• /yenile ile anlık kontrol yapabilirsin\n` +
+    `• Birden fazla arama ekleyebilirsin`;
   
   await sendMessage(helpMsg);
 });
 
-// /ekle komutu - URL ekleme modu
+// /ekle komutu
 bot.onText(/\/ekle/, async (msg) => {
   await sendMessage(
     `🔗 <b>Yeni Arama Ekle</b>\n\n` +
     `1️⃣ Sahibinden.com'da arama yap\n` +
     `2️⃣ URL'i kopyala ve buraya gönder\n` +
     `3️⃣ Kontrol süresini (dakika) gönder\n\n` +
-    `Örnek URL:\n` +
+    `<b>Örnek URL:</b>\n` +
     `<code>https://www.sahibinden.com/kiralik-daire/istanbul</code>\n\n` +
+    `<b>Not:</b> RSS otomatik eklenir, endişelenme!\n\n` +
     `İptal için /iptal yaz`
   );
   
-  // URL bekleme modu
-  const urlListener = bot.once('message', async (urlMsg) => {
+  bot.once('message', async (urlMsg) => {
     if (urlMsg.text === '/iptal') {
       await sendMessage('❌ İptal edildi.');
       return;
@@ -339,7 +323,6 @@ bot.onText(/\/ekle/, async (msg) => {
     
     await sendMessage(`✅ URL kaydedildi!\n\nŞimdi kontrol süresini gir (dakika):\nÖrnek: 5`);
     
-    // Süre bekleme modu
     bot.once('message', async (intervalMsg) => {
       if (intervalMsg.text === '/iptal') {
         await sendMessage('❌ İptal edildi.');
@@ -364,12 +347,12 @@ bot.onText(/\/ekle/, async (msg) => {
       await sendMessage(
         `✅ <b>Arama Eklendi!</b>\n\n` +
         `🔗 URL: ${url}\n` +
-        `⏱ Kontrol: Her ${interval} dakika\n\n` +
+        `⏱ Kontrol: Her ${interval} dakika\n` +
+        `📡 Mod: RSS Feed (hızlı ve güvenilir)\n\n` +
         `Bot çalışıyorsa otomatik başlayacak.\n` +
         `Bot duruyorsa /basla ile başlat!`
       );
       
-      // Bot çalışıyorsa yeni aramayı başlat
       if (isRunning) {
         const index = searches.length - 1;
         startPeriodicCheck(newSearch, index);
@@ -381,7 +364,7 @@ bot.onText(/\/ekle/, async (msg) => {
   });
 });
 
-// /liste komutu - Tüm aramaları listele
+// /liste komutu
 bot.onText(/\/liste/, async (msg) => {
   if (searches.length === 0) {
     await sendMessage('📋 Henüz arama eklenmemiş.\n\n/ekle komutu ile ekleyebilirsin!');
@@ -390,9 +373,11 @@ bot.onText(/\/liste/, async (msg) => {
   
   for (let i = 0; i < searches.length; i++) {
     const search = searches[i];
+    const isDefault = search.id === DEFAULT_SEARCH.id;
+    
     const message = 
-      `📍 <b>Arama ${i + 1}</b>\n\n` +
-      `🔗 ${search.url}\n` +
+      `📍 <b>Arama ${i + 1}</b>${isDefault ? ' (Varsayılan 🚗)' : ''}\n\n` +
+      `🔗 ${search.url.substring(0, 80)}...\n` +
       `⏱ Her ${search.interval} dakika\n` +
       `🆔 ID: ${search.id}`;
     
@@ -420,19 +405,16 @@ bot.on('callback_query', async (query) => {
       return;
     }
     
-    // Interval'i durdur
     if (intervals.has(index)) {
       clearInterval(intervals.get(index));
       intervals.delete(index);
     }
     
-    // Aramayı sil
     const deletedSearch = searches.splice(index, 1)[0];
     seenListings.delete(deletedSearch.url);
     
-    // Mesajı güncelle
     await bot.editMessageText(
-      `✅ <b>Arama Silindi!</b>\n\n🔗 ${deletedSearch.url}`,
+      `✅ <b>Arama Silindi!</b>\n\n🔗 ${deletedSearch.url.substring(0, 60)}...`,
       {
         chat_id: query.message.chat.id,
         message_id: query.message.message_id,
@@ -444,7 +426,6 @@ bot.on('callback_query', async (query) => {
     
     log(`Arama silindi: ${deletedSearch.url}`);
     
-    // Kalan aramaları yeniden indexle
     if (isRunning && searches.length > 0) {
       startAllChecks();
     } else if (searches.length === 0) {
@@ -454,7 +435,7 @@ bot.on('callback_query', async (query) => {
   }
 });
 
-// /yenile komutu - Manuel kontrol
+// /yenile komutu
 bot.onText(/\/yenile/, async (msg) => {
   if (searches.length === 0) {
     await sendMessage('❌ Henüz arama eklenmemiş!\n\n/ekle komutu ile ekle.');
@@ -488,6 +469,7 @@ bot.onText(/\/basla/, async (msg) => {
     await sendMessage(
       `🚀 <b>Bot Başlatıldı!</b>\n\n` +
       `📊 ${searches.length} arama aktif\n` +
+      `📡 RSS Feed modu (hızlı ve güvenilir)\n` +
       `🔔 Yeni ilanlar otomatik bildirilecek\n\n` +
       `Komutlar: /durdur /liste /yenile`
     );
@@ -513,7 +495,8 @@ bot.onText(/\/durum/, async (msg) => {
     `📊 <b>Bot Durumu</b>\n\n` +
     `🤖 Durum: ${isRunning ? '✅ Çalışıyor' : '⏸ Durmuş'}\n` +
     `📋 Arama sayısı: ${searches.length}\n` +
-    `🕐 Uptime: ${process.uptime().toFixed(0)} saniye\n` +
+    `📡 Mod: RSS Feed\n` +
+    `🕐 Uptime: ${Math.floor(process.uptime() / 60)} dakika\n` +
     `💾 Memory: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB\n\n` +
     (searches.length > 0 ? 
       `<b>Aktif Aramalar:</b>\n` + 
@@ -526,7 +509,18 @@ bot.onText(/\/durum/, async (msg) => {
 // Bot başlatma
 function initializeBot() {
   log('🚀 Telegram Bot başlatılıyor...');
-  sendMessage('🤖 Bot yeniden başlatıldı!\n\n/start ile komutları görebilirsin.');
+  
+  // Otomatik başlat
+  if (startAllChecks()) {
+    sendMessage(
+      `🤖 <b>Bot Otomatik Başlatıldı!</b>\n\n` +
+      `🚗 Varsayılan arama: Otomobil ilanları\n` +
+      `📡 RSS Feed modu aktif\n\n` +
+      `/start ile tüm komutları görebilirsin.\n` +
+      `/ekle ile yeni aramalar ekleyebilirsin!`
+    );
+    log('Varsayılan arama ile bot başlatıldı');
+  }
 }
 
 // Hata yakalama
