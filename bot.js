@@ -7,11 +7,21 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || 'BURAYA_TOKEN';
 const CHAT_ID = process.env.CHAT_ID || 'BURAYA_CHAT_ID';
 
-// Ücretsiz proxy rotasyonu
+// Proxy ve User-Agent ayarları
+const ENV_PROXIES = process.env.PROXIES ? process.env.PROXIES.split(',').map(p => p.trim()) : [];
 const FREE_PROXIES = [
+  ...ENV_PROXIES,
   'http://proxy.toolip.io:31112',
   'http://proxy-pr.privoxy.org:8118',
   'http://proxy.fluxdesk.work:3128',
+];
+
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 ];
 
 let currentProxyIndex = 0;
@@ -19,7 +29,7 @@ let currentProxyIndex = 0;
 // Telegram bot (polling mode)
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// HTTP server (Railway için)
+// HTTP server (Railway/Render için)
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -27,7 +37,8 @@ http.createServer((req, res) => {
     <h1>🤖 Bot Çalışıyor!</h1>
     <p>Son kontrol: ${new Date().toLocaleString('tr-TR')}</p>
     <p>Aktif aramalar: ${searches.length}</p>
-    <p>Proxy: ${FREE_PROXIES[currentProxyIndex]}</p>
+    <p>Proxy Sayısı: ${FREE_PROXIES.length}</p>
+    <p>Aktif Proxy: ${FREE_PROXIES[currentProxyIndex] || 'YOK (Direct)'}</p>
   `);
 }).listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server ${PORT} portunda başladı`);
@@ -52,6 +63,10 @@ function log(message) {
   console.log(`[${time}] ${message}`);
 }
 
+function getRandomUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
 // Telegram mesaj gönder
 async function sendMessage(text, options = {}) {
   try {
@@ -67,8 +82,10 @@ async function sendMessage(text, options = {}) {
 
 // Proxy değiştir
 function rotateProxy() {
-  currentProxyIndex = (currentProxyIndex + 1) % FREE_PROXIES.length;
-  log(`Proxy değiştirildi: ${FREE_PROXIES[currentProxyIndex]}`);
+  if (FREE_PROXIES.length > 0) {
+    currentProxyIndex = (currentProxyIndex + 1) % FREE_PROXIES.length;
+    log(`Proxy değiştirildi: ${FREE_PROXIES[currentProxyIndex]}`);
+  }
 }
 
 // URL'den RSS feed URL'si oluştur
@@ -83,25 +100,32 @@ function getRssFeedUrl(searchUrl) {
 
 // RSS feed'i çek (Proxy ile)
 async function fetchRssFeed(url, retryCount = 0) {
-  const maxRetries = FREE_PROXIES.length;
+  // Eğer proxy listesi boşsa ve ENV_PROXIES de boşsa, sadece 1 kere direct dene
+  // Eğer proxy varsa, proxy sayısı kadar dene
+  const maxRetries = FREE_PROXIES.length > 0 ? FREE_PROXIES.length : 1;
   
   return new Promise((resolve, reject) => {
-    const proxyUrl = FREE_PROXIES[currentProxyIndex];
-    
+    let proxyUrl = null;
     let agent;
-    try {
-      agent = new HttpsProxyAgent(proxyUrl);
-    } catch (e) {
-      // Proxy hatası, direkt bağlan
-      agent = undefined;
+
+    if (FREE_PROXIES.length > 0) {
+       proxyUrl = FREE_PROXIES[currentProxyIndex];
+       try {
+         agent = new HttpsProxyAgent(proxyUrl);
+       } catch (e) {
+         log(`Proxy hatası (${proxyUrl}): ${e.message}, direkt deneniyor.`);
+         agent = undefined;
+       }
     }
     
     const options = {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': getRandomUserAgent(),
         'Accept': 'application/rss+xml, application/xml, text/xml, */*',
         'Accept-Language': 'tr-TR,tr;q=0.9',
         'Referer': 'https://www.sahibinden.com',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
       },
       timeout: 15000
     };
@@ -110,6 +134,8 @@ async function fetchRssFeed(url, retryCount = 0) {
       options.agent = agent;
     }
     
+    log(`İstek: ${url.substring(0, 50)}... via ${proxyUrl || 'DIRECT'}`);
+
     const req = https.get(url, options, (res) => {
       let data = '';
       
@@ -118,13 +144,18 @@ async function fetchRssFeed(url, retryCount = 0) {
       res.on('end', () => {
         if (res.statusCode === 200) {
           resolve(data);
-        } else if (res.statusCode === 403 && retryCount < maxRetries) {
-          log(`403 hatası, proxy değiştiriliyor... (${retryCount + 1}/${maxRetries})`);
+        } else if ((res.statusCode === 403 || res.statusCode === 429 || res.statusCode === 407) && retryCount < maxRetries) {
+          log(`Hata: ${res.statusCode}, proxy değiştiriliyor... (${retryCount + 1}/${maxRetries})`);
           rotateProxy();
           setTimeout(() => {
             fetchRssFeed(url, retryCount + 1).then(resolve).catch(reject);
           }, 2000);
         } else {
+          log(`İstek başarısız: HTTP ${res.statusCode}`);
+          if (res.statusCode === 403) {
+             // Cloudflare veya benzeri bir engelleme
+             // log('Response body snippet: ' + data.substring(0, 100));
+          }
           reject(new Error(`HTTP ${res.statusCode}`));
         }
       });
@@ -132,7 +163,7 @@ async function fetchRssFeed(url, retryCount = 0) {
     
     req.on('error', (error) => {
       if (retryCount < maxRetries) {
-        log(`Bağlantı hatası, yeniden deneniyor... (${retryCount + 1}/${maxRetries})`);
+        log(`Bağlantı hatası (${error.message}), yeniden deneniyor... (${retryCount + 1}/${maxRetries})`);
         rotateProxy();
         setTimeout(() => {
           fetchRssFeed(url, retryCount + 1).then(resolve).catch(reject);
@@ -205,8 +236,6 @@ async function parseRss(xml) {
 async function fetchListings(searchUrl) {
   try {
     const rssUrl = getRssFeedUrl(searchUrl);
-    log(`RSS feed açılıyor: ${rssUrl.substring(0, 80)}...`);
-    log(`Kullanılan proxy: ${FREE_PROXIES[currentProxyIndex]}`);
     
     const xml = await fetchRssFeed(rssUrl);
     const listings = await parseRss(xml);
@@ -233,7 +262,7 @@ async function checkNewListings(search, manualCheck = false) {
     if (listings.length === 0) {
       log('İlan bulunamadı');
       if (manualCheck) {
-        await sendMessage('⚠️ İlan bulunamadı. Tüm proxy\'ler denendi.');
+        await sendMessage('⚠️ İlan bulunamadı veya erişim hatası (Proxy/Cloudflare).');
       }
       return;
     }
@@ -541,7 +570,8 @@ bot.onText(/\/durum/, async (msg) => {
     `📊 <b>Bot Durumu</b>\n\n` +
     `🤖 ${isRunning ? '✅ Çalışıyor' : '⏸ Durmuş'}\n` +
     `📋 Arama: ${searches.length}\n` +
-    `🔐 Proxy: ${FREE_PROXIES[currentProxyIndex]}\n` +
+    `🔐 Proxy Listesi: ${FREE_PROXIES.length} adet\n` +
+    `👉 Aktif Proxy: ${FREE_PROXIES[currentProxyIndex] || 'YOK'}\n` +
     `🕐 Uptime: ${Math.floor(process.uptime() / 60)} dk\n` +
     `💾 RAM: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`;
   
